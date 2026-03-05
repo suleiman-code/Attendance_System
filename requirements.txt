@@ -1,0 +1,6 @@
+deepface
+tf-keras
+opencv-python
+numpy
+mediapipe
+retina-face

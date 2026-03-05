@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pkl
+.ipynb_checkpoints/
+.venv/
+env/
+# Ignore personal face data if desired, but keeping it for now as per project context
+# faces/*.jpg
+# faces/*.png
