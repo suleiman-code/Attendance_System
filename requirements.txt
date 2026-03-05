@@ -4,3 +4,8 @@ opencv-python
 numpy
 mediapipe
 retina-face
+streamlit
+streamlit-webrtc
+av
+mtcnn
+ultralytics

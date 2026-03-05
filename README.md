@@ -36,16 +36,21 @@ Yeh aik advanced Computer Vision project hay jo Real-Time chehron ko detect kart
    ```
    *Tip: 3-4 photos save karein mukhtalif angles (Front, Side, Mask) ke saath behtar results ke liye.*
 
-3. **Run Recognition:**
+3. **Run Recognition (OpenCV Version):**
    ```bash
    python app.py
    ```
-   Press **'q'** or click the **'X'** on window to quit.
+
+4. **Run Recognition (Streamlit Web Dashboard):**
+   ```bash
+   streamlit run web_app.py
+   ```
+   *Note: This will open a modern dashboard in your browser.*
 
 ## 🔒 Accuracy Tips
 - Light achi honi chahiye.
 - `faces/` folder mein images clear honi chahiye.
-- Agar system "Unknown" kahay, to `app.py` mein `distance < 0.68` ki value ko thora barha den (e.g. 0.70).
+- **Side Profile:** Agar system side se pehchan nahi raha, to `capture.py` se side face ki aik aur photo save karein.
 
 ---
 **Developed with ❤️ by Your Computer Vision Expert AI.**
