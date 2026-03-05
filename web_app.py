@@ -3,43 +3,81 @@ import cv2
 import numpy as np
 import os
 from deepface import DeepFace
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from streamlit_webrtc import webrtc_streamer
 import av
+import time
 
-# Page Config
-st.set_page_config(page_title="AI Face Recognition", layout="wide")
+# --- STYLING & UI ---
+st.set_page_config(page_title="VisionAI Pro", layout="wide", initial_sidebar_state="expanded")
 
-st.title("🛡️ AI Face Recognition Dashboard")
+st.markdown("""
+    <style>
+    .stApp {
+        background: radial-gradient(circle, #1e293b 0%, #0f172a 100%);
+        color: white;
+    }
+    .stButton>button {
+        width: 100%;
+        border-radius: 10px;
+        background: linear-gradient(45deg, #3b82f6, #2563eb);
+        color: white;
+        border: none;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.title("🛡️ VisionAI Professional Dashboard")
 st.markdown("---")
 
-# Sidebar for Settings
-st.sidebar.header("⚙️ Configuration")
-detector_choice = st.sidebar.selectbox("Choose Detector", ["mtcnn", "opencv", "mediapipe"])
-threshold = st.sidebar.slider("Match Threshold", 0.0, 1.0, 0.68)
+# --- SETTINGS ---
+st.sidebar.header("🕹️ AI Control Panel")
+detector_choice = st.sidebar.selectbox(
+    "Select Face Detector", 
+    ["mtcnn", "retinaface", "yolov8"], 
+    index=0,
+    help="MTCNN (Speed), RetinaFace (Accuracy), YOLOv8 (Robustness)"
+)
+
+threshold = st.sidebar.slider("Match Sensitivity", 0.0, 1.0, 0.72)
 
 DB_PATH = "faces"
 
-# Ensure faces directory
-if not os.path.exists(DB_PATH):
-    os.makedirs(DB_PATH)
+# Model Warmup for Smoothness
+@st.cache_resource
+def warm_up_detector(detector_name):
+    dummy_img = np.zeros((224, 224, 3), dtype=np.uint8)
+    try:
+        DeepFace.extract_faces(img_path=dummy_img, detector_backend=detector_name, enforce_detection=False)
+        return True
+    except:
+        return False
 
-# Database Refresh Logic
-if st.sidebar.button("🔄 Refresh Database"):
+is_ready = warm_up_detector(detector_choice)
+
+# Database Refresh
+if st.sidebar.button("🔄 Sync Face Database"):
     for f in os.listdir(DB_PATH):
         if f.endswith(".pkl"):
             os.remove(os.path.join(DB_PATH, f))
     st.sidebar.success("Database Refreshed!")
 
+# --- VIDEO CALLBACK ---
 def video_frame_callback(frame):
     img = frame.to_ndarray(format="bgr24")
     
+    if not is_ready:
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
     try:
-        results = DeepFace.find(img_path=img, 
-                                db_path=DB_PATH, 
-                                model_name='ArcFace', 
-                                detector_backend=detector_choice, 
-                                enforce_detection=False,
-                                silent=True)
+        results = DeepFace.find(
+            img_path=img, 
+            db_path=DB_PATH, 
+            model_name='ArcFace', 
+            detector_backend=detector_choice, 
+            enforce_detection=False,
+            align=True, # Critical for MTCNN
+            silent=True
+        )
         
         if len(results) > 0 and not results[0].empty:
             match = results[0].iloc[0]
@@ -51,45 +89,39 @@ def video_frame_callback(frame):
             if dist < threshold:
                 name = os.path.basename(match['identity']).split('.')[0]
                 name = ''.join([i for i in name if not i.isdigit()]).capitalize()
-                color = (0, 255, 0)
-                label = f"{name} {confidence:.1f}%"
+                color, label = (0, 255, 0), f"{name} ({confidence:.1f}%)"
             else:
-                color = (0, 0, 255)
-                label = "Unknown"
+                color, label = (0, 0, 255), "Unknown"
 
             cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
-            cv2.rectangle(img, (x, y - 35), (x + w, y), color, -1)
+            cv2.rectangle(img, (x, y - 30), (x + w, y), color, -1)
             cv2.putText(img, label, (x + 5, y - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-    except Exception as e:
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    except:
         pass
 
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# Main Section
 col1, col2 = st.columns([2, 1])
-
 with col1:
-    st.subheader("🎥 Live Feed")
-    webrtc_streamer(key="face-rec", 
-                    video_frame_callback=video_frame_callback,
-                    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+    st.markdown("### 📡 Live Feed")
+    webrtc_streamer(
+        key="vision-ai-final", 
+        video_frame_callback=video_frame_callback,
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"video": True, "audio": False}
+    )
 
 with col2:
-    st.subheader("ℹ️ System Status")
-    st.info(f"Active Model: ArcFace")
-    st.info(f"Detector: {detector_choice.upper()}")
-    
-    # List known people
-    st.write("👥 Known People in Database:")
+    st.markdown("### 📊 System Status")
+    st.metric("Active Detector", detector_choice.upper())
+    st.write("---")
+    st.write("👥 **Recognized Database:**")
     known_files = [f for f in os.listdir(DB_PATH) if f.endswith(('.jpg', '.png'))]
     if known_files:
-        unique_names = list(set([''.join([i for i in f.split('.')[0] if not i.isdigit()]).capitalize() for f in known_files]))
-        for name in unique_names:
-            st.success(f"✓ {name}")
-    else:
-        st.warning("No faces found in database!")
+        names = set([''.join([i for i in f.split('.')[0] if not i.isdigit()]).capitalize() for f in known_files])
+        for n in names: st.success(f"Verified: {n}")
+    else: st.warning("Database empty.")
 
 st.markdown("---")
-st.caption("Developed by Suleiman Code | Powered by DeepFace & Streamlit")
+st.caption("AI Face ID Pro | Version 4.1")
