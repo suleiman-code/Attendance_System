@@ -73,7 +73,16 @@ st.markdown("""
 # --- CONSTANTS ---
 DB_PATH = "faces"
 ATTENDANCE_FILE = "attendance_log.csv"
+REQUIRED_PHOTOS = 6  # Minimum photos required for enrollment
 os.makedirs(DB_PATH, exist_ok=True)
+
+# Auto-refresh database cache on startup (once per session)
+if 'db_refreshed' not in st.session_state:
+    st.session_state.db_refreshed = True
+    # Clear old cache files
+    for f in os.listdir(DB_PATH):
+        if f.endswith(".pkl"):
+            os.remove(os.path.join(DB_PATH, f))
 
 # --- SESSION STATE ---
 if 'page' not in st.session_state:
@@ -82,17 +91,103 @@ if 'enrolled_today' not in st.session_state:
     st.session_state.enrolled_today = []
 if 'recognized_today' not in st.session_state:
     st.session_state.recognized_today = set()
+    # Load today's attendance from CSV so state persists across sessions
+    if os.path.exists(ATTENDANCE_FILE):
+        today = datetime.now().strftime("%Y-%m-%d")
+        try:
+            existing_df = pd.read_csv(ATTENDANCE_FILE)
+            for _, row in existing_df.iterrows():
+                if str(row['Date']) == today:
+                    st.session_state.recognized_today.add(f"{row['Name']}_{today}")
+        except Exception:
+            pass
+if 'current_enrollment_name' not in st.session_state:
+    st.session_state.current_enrollment_name = ''
+if 'current_photo_count' not in st.session_state:
+    st.session_state.current_photo_count = 0
+if 'show_replace_dialog' not in st.session_state:
+    st.session_state.show_replace_dialog = False
+if 'temp_images' not in st.session_state:
+    st.session_state.temp_images = []
 
 # --- HELPER FUNCTIONS ---
 def get_registered_faces():
-    """Get list of registered face names"""
+    """Get list of registered face names - supports any naming format"""
     faces = set()
     for f in os.listdir(DB_PATH):
         if f.lower().endswith(('.jpg', '.jpeg', '.png')):
-            name = ''.join([c for c in f.split('.')[0] if not c.isdigit()]).replace('_', ' ').strip().title()
-            if name:
+            # Support multiple naming formats:
+            # Format 1: name_1.jpg, name_2.jpg (structured)
+            # Format 2: name.jpg (simple)
+            # Format 3: name_anything.jpg (manual add)
+            basename = f.rsplit('.', 1)[0]  # Remove extension
+            
+            # Try to extract name (first part before underscore or full name)
+            if '_' in basename:
+                name = basename.split('_')[0]
+            else:
+                name = basename
+            
+            name = name.strip().title()
+            if name and len(name) > 1:
                 faces.add(name)
     return sorted(list(faces))
+
+def get_user_photo_count(name):
+    """Count how many photos exist for a user - supports any naming format"""
+    name_lower = name.lower().replace(' ', '_')
+    count = 0
+    for f in os.listdir(DB_PATH):
+        if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+            basename = f.rsplit('.', 1)[0].lower()
+            # Match: name_1, name_2, name_anything, or just name
+            if basename == name_lower or basename.startswith(name_lower + '_'):
+                count += 1
+    return count
+
+def is_user_enrolled(name):
+    """Check if user is already enrolled with 6 photos"""
+    return get_user_photo_count(name) >= REQUIRED_PHOTOS
+
+def is_user_registered(name):
+    """Check if user has ANY photos in database (for recognition)"""
+    return get_user_photo_count(name) >= 1
+
+def get_next_photo_number(name):
+    """Get next photo number for user (1-6)"""
+    name_lower = name.lower().replace(' ', '_')
+    existing_numbers = []
+    for f in os.listdir(DB_PATH):
+        if f.lower().startswith(name_lower + '_') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
+            try:
+                num = int(f.split('_')[1].split('.')[0])
+                existing_numbers.append(num)
+            except:
+                pass
+    
+    for i in range(1, REQUIRED_PHOTOS + 1):
+        if i not in existing_numbers:
+            return i
+    return None
+
+def delete_user_photos(name):
+    """Delete all photos for a user"""
+    name_lower = name.lower().replace(' ', '_')
+    deleted = 0
+    for f in os.listdir(DB_PATH):
+        if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+            basename = f.rsplit('.', 1)[0].lower()
+            if basename == name_lower or basename.startswith(name_lower + '_'):
+                os.remove(os.path.join(DB_PATH, f))
+                deleted += 1
+    refresh_database()
+    return deleted
+
+def is_attendance_marked_today(name):
+    """Check if attendance already marked today for this person"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    key = f"{name}_{today}"
+    return key in st.session_state.recognized_today
 
 def refresh_database():
     """Clear cached embeddings"""
@@ -137,6 +232,144 @@ def detect_face_haar(image):
     faces = cascade.detectMultiScale(gray, 1.1, 4)
     return faces
 
+def detect_face_advanced(image):
+    """Advanced face detection - works with masks and angles"""
+    faces = []
+    
+    # Try multiple detection methods
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Method 1: Frontal face
+    frontal_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    frontal_faces = frontal_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
+    
+    # Method 2: Frontal face alt (better for some angles)
+    frontal_alt = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt.xml')
+    alt_faces = frontal_alt.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
+    
+    # Method 3: Profile face (side view)
+    profile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
+    profile_faces = profile_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
+    
+    # Combine all detections
+    all_faces = list(frontal_faces) + list(alt_faces) + list(profile_faces)
+    
+    if len(all_faces) > 0:
+        # Return the largest face found
+        all_faces = sorted(all_faces, key=lambda f: f[2] * f[3], reverse=True)
+        return [all_faces[0]]
+    
+    return []
+
+def crop_face(image, face_coords, padding=30):
+    """Crop only the face from image with padding"""
+    x, y, w, h = face_coords
+    height, width = image.shape[:2]
+    
+    # Add padding around face
+    x1 = max(0, x - padding)
+    y1 = max(0, y - padding)
+    x2 = min(width, x + w + padding)
+    y2 = min(height, y + h + padding)
+    
+    # Crop face region
+    face_img = image[y1:y2, x1:x2]
+    
+    # Resize to standard size for better recognition
+    face_img = cv2.resize(face_img, (224, 224))
+    
+    return face_img
+
+def check_liveness(image, face_coords):
+    """
+    Basic liveness detection to prevent photo spoofing attacks.
+    Checks texture sharpness and color variation - real faces have more detail.
+    Returns: (is_live, score, reason)
+    """
+    x, y, w, h = face_coords
+    height, width = image.shape[:2]
+    
+    # Extract face region with padding
+    pad = 20
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(width, x + w + pad)
+    y2 = min(height, y + h + pad)
+    face_region = image[y1:y2, x1:x2]
+    
+    if face_region.size == 0:
+        return False, 0, "No face region"
+    
+    # Resize for consistent analysis
+    face_region = cv2.resize(face_region, (200, 200))
+    gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+    
+    # CHECK 1: Laplacian variance (texture sharpness)
+    # Real faces have more texture/detail than photos of photos
+    laplacian = cv2.Laplacian(gray_face, cv2.CV_64F)
+    laplacian_var = laplacian.var()
+    
+    # CHECK 2: Color variation in skin regions
+    # Real faces have subtle color variations, photos are more uniform
+    hsv = cv2.cvtColor(face_region, cv2.COLOR_BGR2HSV)
+    h_std = np.std(hsv[:,:,0])  # Hue variation
+    s_std = np.std(hsv[:,:,1])  # Saturation variation
+    
+    # CHECK 3: Edge density (real faces have more micro-edges)
+    edges = cv2.Canny(gray_face, 50, 150)
+    edge_density = np.sum(edges > 0) / edges.size
+    
+    # Scoring (tuned thresholds)
+    # Photos displayed on screens typically have:
+    # - Lower laplacian variance (less sharp/detailed)
+    # - Different color patterns (screen pixels visible)
+    # - Moire patterns or reflections
+    
+    score = 0
+    reasons = []
+    
+    # Laplacian threshold (real face usually > 100, photo < 80)
+    if laplacian_var > 50:
+        score += 35
+    else:
+        reasons.append(f"Low texture ({laplacian_var:.0f})")
+    
+    # Color variation (real face has more variation)
+    if h_std > 15 and s_std > 30:
+        score += 35
+    else:
+        reasons.append(f"Flat colors (H:{h_std:.0f}, S:{s_std:.0f})")
+    
+    # Edge density (real face 0.05-0.15, photo often different)
+    if 0.03 < edge_density < 0.25:
+        score += 30
+    else:
+        reasons.append(f"Edge pattern ({edge_density:.2f})")
+    
+    is_live = score >= 60
+    reason = "LIVE" if is_live else "; ".join(reasons) if reasons else "Failed checks"
+    
+    return is_live, score, reason
+
+def get_existing_photo_numbers(name):
+    """Get list of existing photo numbers for a user"""
+    name_lower = name.lower()
+    existing = []
+    for f in os.listdir(DB_PATH):
+        if f.lower().startswith(name_lower + '_') and f.lower().endswith(('.jpg', '.jpeg', '.png')):
+            try:
+                num = int(f.split('_')[1].split('.')[0])
+                existing.append(num)
+            except:
+                pass
+    return sorted(existing)
+
+def get_missing_photo_numbers(name):
+    """Get list of missing photo numbers (1-6) for a user"""
+    existing = get_existing_photo_numbers(name)
+    missing = [i for i in range(1, REQUIRED_PHOTOS + 1) if i not in existing]
+    return missing
+
 # --- SIDEBAR ---
 with st.sidebar:
     st.markdown("## 🎛️ Control Panel")
@@ -168,6 +401,15 @@ with st.sidebar:
     if st.button("🔄 Refresh DB", use_container_width=True):
         count = refresh_database()
         st.success(f"Cleared {count} cache files!")
+    
+    if st.button("🗑️ Clear Attendance", use_container_width=True):
+        # Reset session state completely
+        st.session_state.recognized_today = set()
+        # Delete the attendance file
+        if os.path.exists(ATTENDANCE_FILE):
+            os.remove(ATTENDANCE_FILE)
+        st.success("✅ All attendance records deleted!")
+        st.rerun()
     
     st.markdown("---")
     st.caption("VisionAI Pro v2.0")
@@ -215,86 +457,159 @@ if st.session_state.page == 'home':
             st.session_state.page = 'recognition'
             st.rerun()
     
-    # Quick stats
+    # Quick stats - only registered faces
     st.markdown("---")
     st.markdown("### 📊 Quick Stats")
     
-    stat1, stat2, stat3 = st.columns(3)
-    with stat1:
-        st.metric("Registered Faces", len(get_registered_faces()))
-    with stat2:
-        df = get_attendance_data()
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_count = len(df[df['Date'] == today]) if not df.empty else 0
-        st.metric("Today's Attendance", today_count)
-    with stat3:
-        st.metric("Total Records", len(df))
+    st.metric("Registered Users", len(get_registered_faces()))
 
 # ==================== ENROLLMENT PAGE ====================
 elif st.session_state.page == 'enrollment':
     st.markdown('<p class="big-title">📸 Face Enrollment</p>', unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center; color:#888;'>Register a new face in the system</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center; color:#888;'>Register a new face in the system (6 photos required)</p>", unsafe_allow_html=True)
     st.markdown("---")
     
     # Name input
-    name = st.text_input("👤 Enter Name", placeholder="e.g., Ahmed Khan")
+    name = st.text_input("👤 Enter Name", placeholder="e.g., Suleiman")
     
     if name:
         name_clean = name.strip().replace(' ', '_').title()
+        current_count = get_user_photo_count(name_clean)
+        existing_nums = get_existing_photo_numbers(name_clean)
+        missing_nums = get_missing_photo_numbers(name_clean)
         
-        st.markdown("### 📷 Take Photo")
-        st.info("💡 Tips: Look directly at camera, ensure good lighting, remove glasses")
-        
-        # Camera input
-        camera_photo = st.camera_input("Click to capture your face")
-        
-        if camera_photo:
-            # Convert to OpenCV format
-            file_bytes = np.asarray(bytearray(camera_photo.read()), dtype=np.uint8)
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        # CASE 1: User is fully enrolled (6 photos) - Show replace option
+        if current_count >= REQUIRED_PHOTOS:
+            st.success(f"✅ **{name_clean}** is already enrolled with {current_count} photos!")
+            st.warning("⚠️ This user is already registered. Do you want to replace?")
             
-            # Detect face
-            faces = detect_face_haar(image)
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, Replace All", use_container_width=True, type="primary"):
+                    delete_user_photos(name_clean)
+                    st.success(f"✅ All photos deleted. You can now re-enroll {name_clean}")
+                    st.rerun()
+            with col2:
+                if st.button("❌ No, Keep", use_container_width=True):
+                    st.info("Photos kept. Choose a different name or go to Recognition.")
+        
+        # CASE 2: Partial enrollment - Continue from where left
+        elif current_count > 0:
+            st.markdown(f"### 📊 Enrollment Progress: {current_count}/{REQUIRED_PHOTOS}")
+            st.progress(current_count / REQUIRED_PHOTOS)
+            st.warning(f"⚠️ **{name_clean}** has {current_count}/{REQUIRED_PHOTOS} photos - Continue enrollment")
+            st.info(f"📸 Need to capture: Photo {', '.join([str(n) for n in missing_nums])}")
+        
+        # CASE 3: New user - First time enrollment
+        else:
+            st.markdown(f"### 📊 New Enrollment for {name_clean}")
+            st.progress(0.0)
+            st.info(f"👋 Welcome **{name_clean}**! Let's capture 6 photos for enrollment.")
+        
+        # Show enrollment form if not fully enrolled
+        if current_count < REQUIRED_PHOTOS:
+            next_photo_num = missing_nums[0] if missing_nums else current_count + 1
+            remaining = REQUIRED_PHOTOS - current_count
             
-            if len(faces) > 0:
-                st.success("✅ Face detected!")
+            st.markdown("---")
+            st.markdown(f"### 📷 Capture Photo #{next_photo_num} ({remaining} remaining)")
+            st.markdown("""
+            💡 **Tips for best results:**
+            - 📷 Photo 1-2: Look **straight** at camera
+            - 👈 Photo 3-4: **Turn left/right** slightly  
+            - 😊 Photo 5-6: Different **expressions** or **with mask**
+            - ☀️ Ensure **good lighting**
+            """)
+            
+            # Camera input
+            camera_photo = st.camera_input(f"📷 Capture Photo {next_photo_num} of {REQUIRED_PHOTOS} ({remaining} remaining)")
+            
+            if camera_photo:
+                # Convert to OpenCV format
+                file_bytes = np.asarray(bytearray(camera_photo.read()), dtype=np.uint8)
+                image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
                 
-                # Draw rectangle on face
-                display_img = image.copy()
-                for (x, y, w, h) in faces:
-                    cv2.rectangle(display_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                # Detect face using advanced detection (works with masks & angles)
+                faces = detect_face_advanced(image)
                 
-                # Show preview
-                st.image(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB), caption="Preview", use_container_width=True)
-                
-                # Save button
-                if st.button("💾 Save Face", use_container_width=True, type="primary"):
-                    timestamp = datetime.now().strftime("%H%M%S")
-                    filename = f"{name_clean}_{timestamp}.jpg"
-                    filepath = os.path.join(DB_PATH, filename)
+                if len(faces) > 0:
+                    st.success("✅ Face detected!")
                     
-                    cv2.imwrite(filepath, image)
-                    refresh_database()  # Clear cache for fresh recognition
+                    # Get face coordinates
+                    (x, y, w, h) = faces[0]
                     
-                    st.session_state.enrolled_today.append(name_clean)
-                    st.success(f"✅ Saved: {filename}")
-                    st.balloons()
-            else:
-                st.error("❌ No face detected! Please try again with better lighting.")
+                    # Crop only face
+                    face_only = crop_face(image, (x, y, w, h), padding=40)
+                    
+                    # Draw rectangle on original for preview
+                    display_img = image.copy()
+                    cv2.rectangle(display_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
+                    
+                    # Show both preview
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.image(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB), caption="📷 Original (Face Detected)", use_container_width=True)
+                    with col2:
+                        st.image(cv2.cvtColor(face_only, cv2.COLOR_BGR2RGB), caption="✂️ Cropped Face (This will be saved)", use_container_width=True)
+                    
+                    # Save button
+                    if st.button(f"💾 Save Face Photo {next_photo_num}", use_container_width=True, type="primary"):
+                        filename = f"{name_clean}_{next_photo_num}.jpg"
+                        filepath = os.path.join(DB_PATH, filename)
+                        
+                        # Save cropped face only
+                        cv2.imwrite(filepath, face_only)
+                        refresh_database()
+                        
+                        st.success(f"✅ Saved: {filename}")
+                        
+                        new_count = get_user_photo_count(name_clean)
+                        if new_count >= REQUIRED_PHOTOS:
+                            st.balloons()
+                            st.success(f"🎉 **{name_clean}** successfully enrolled with {REQUIRED_PHOTOS} photos!")
+                            st.session_state.enrolled_today.append(name_clean)
+                        else:
+                            new_remaining = REQUIRED_PHOTOS - new_count
+                            st.info(f"📸 {new_remaining} more photo(s) to go!")
+                        
+                        st.rerun()
+                else:
+                    st.error("❌ No face detected! Try better lighting or different angle.")
+        
+        # Show enrolled photos if any exist
+        if current_count > 0:
+            st.markdown("---")
+            st.markdown(f"### 📂 {name_clean}'s Enrolled Photos ({current_count}/{REQUIRED_PHOTOS})")
+            cols = st.columns(6)
+            for i in range(1, REQUIRED_PHOTOS + 1):
+                filepath = os.path.join(DB_PATH, f"{name_clean}_{i}.jpg")
+                with cols[i-1]:
+                    if os.path.exists(filepath):
+                        img = cv2.imread(filepath)
+                        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=f"#{i} ✅", use_container_width=True)
+                    else:
+                        st.markdown(f"<div style='background:#333;padding:20px;text-align:center;border-radius:10px;'>#{i} ❌</div>", unsafe_allow_html=True)
     else:
         st.warning("👆 Please enter a name first")
     
-    # Show recently enrolled
-    if st.session_state.enrolled_today:
-        st.markdown("---")
-        st.markdown("### ✅ Recently Enrolled")
-        for n in st.session_state.enrolled_today[-5:]:
-            st.write(f"• {n}")
+    # Show registered users
+    st.markdown("---")
+    st.markdown("### 👥 All Registered Users")
+    registered = get_registered_faces()
+    if registered:
+        for user in registered:
+            count = get_user_photo_count(user)
+            if count >= REQUIRED_PHOTOS:
+                st.write(f"✅ **{user}** - {count} photos (Complete)")
+            else:
+                st.write(f"⏳ **{user}** - {count}/{REQUIRED_PHOTOS} photos (Incomplete)")
+    else:
+        st.info("No users registered yet.")
 
 # ==================== RECOGNITION PAGE ====================
 elif st.session_state.page == 'recognition':
-    st.markdown('<p class="big-title">🔍 Face Recognition</p>', unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center; color:#888;'>Identify faces and mark attendance</p>", unsafe_allow_html=True)
+    st.markdown('<p class="big-title">🔍 Real-Time Face Recognition</p>', unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center; color:#888;'>Live detection - Name & Score shown instantly!</p>", unsafe_allow_html=True)
     st.markdown("---")
     
     # Check if faces exist
@@ -305,95 +620,175 @@ elif st.session_state.page == 'recognition':
             st.session_state.page = 'enrollment'
             st.rerun()
     else:
-        st.success(f"✅ {len(registered)} faces in database: {', '.join(registered)}")
+        st.success(f"✅ {len(registered)} users in database: {', '.join(registered)}")
         
-        st.markdown("### 📷 Capture Face to Recognize")
+        st.markdown("### 📹 Live Camera Feed")
+        st.info("💡 Camera detects face automatically - Name & Score shown in real-time!")
         
-        # Camera input
-        camera_photo = st.camera_input("Click to capture and recognize")
+        # Camera input with auto-capture
+        camera_photo = st.camera_input("📷 Point camera at face - Detection is automatic", key="recognition_camera")
         
         if camera_photo:
             # Convert to OpenCV format
             file_bytes = np.asarray(bytearray(camera_photo.read()), dtype=np.uint8)
             image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
             
-            with st.spinner("🔄 Analyzing face..."):
-                try:
-                    from deepface import DeepFace
-                    
-                    results = DeepFace.find(
-                        img_path=image,
-                        db_path=DB_PATH,
-                        model_name='ArcFace',
-                        detector_backend='opencv',
-                        enforce_detection=False,
-                        silent=True
-                    )
-                    
-                    display_img = image.copy()
-                    found_someone = False
-                    
+            display_img = image.copy()
+            found_someone = False
+            recognized_name = None
+            recognized_confidence = 0
+            already_marked = False
+            spoof_detected = False
+            
+            try:
+                from deepface import DeepFace
+                
+                # Use DeepFace directly on full image - it handles face detection
+                results = DeepFace.find(
+                    img_path=image,
+                    db_path=DB_PATH,
+                    model_name='ArcFace',
+                    detector_backend='opencv',
+                    enforce_detection=False,
+                    silent=True
+                )
+                
+                if results and len(results) > 0:
                     for df in results:
                         if df.empty:
                             continue
                         
-                        for idx, match in df.iterrows():
-                            dist = match['distance']
-                            confidence = max(0, min(100, (1 - dist/0.8) * 100))
-                            
-                            x = int(match['source_x'])
-                            y = int(match['source_y'])
-                            w = int(match['source_w'])
-                            h = int(match['source_h'])
-                            
-                            if dist < 0.68:
-                                identity = os.path.basename(match['identity']).split('.')[0]
-                                identity = ''.join([c for c in identity if not c.isdigit()]).replace('_', ' ').strip().title()
-                                
-                                # Draw green box
-                                cv2.rectangle(display_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
-                                label = f"{identity} ({confidence:.0f}%)"
-                                cv2.putText(display_img, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                                
-                                found_someone = True
-                                
-                                # Log attendance
-                                if log_attendance(identity, confidence):
-                                    st.success(f"✅ **{identity}** identified! Attendance marked.")
-                                else:
-                                    st.info(f"ℹ️ **{identity}** already marked today.")
-                            else:
-                                # Draw red box
-                                cv2.rectangle(display_img, (x, y), (x+w, y+h), (0, 0, 255), 3)
-                                cv2.putText(display_img, "Unknown", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    
-                    # Show result
-                    st.image(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB), caption="Recognition Result", use_container_width=True)
-                    
-                    if not found_someone:
-                        st.warning("⚠️ No registered face found. Try enrolling first.")
+                        # Sort by distance to get top matches
+                        df_sorted = df.sort_values('distance')
+                        best_match = df_sorted.iloc[0]
+                        best_dist = best_match['distance']
                         
-                except ImportError:
-                    st.error("❌ DeepFace not installed! Run: `python -m pip install deepface tf-keras`")
-                except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
-        
-        # Today's recognized
-        st.markdown("---")
-        st.markdown("### 📋 Today's Attendance")
-        df = get_attendance_data()
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_df = df[df['Date'] == today] if not df.empty else pd.DataFrame()
-        
-        if not today_df.empty:
-            for _, row in today_df.iterrows():
-                st.markdown(f"""
-                <div class="success-box">
-                    <strong>{row['Name']}</strong> — {row['Time']} ({row['Confidence']})
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("No attendance recorded today yet.")
+                        # Get face coordinates
+                        fx = int(best_match['source_x'])
+                        fy = int(best_match['source_y'])
+                        fw = int(best_match['source_w'])
+                        fh = int(best_match['source_h'])
+                        
+                        # Extract name from best match
+                        fname = os.path.basename(best_match['identity'])
+                        if '_' in fname:
+                            identity = fname.split('_')[0].title()
+                        else:
+                            identity = fname.rsplit('.', 1)[0].title()
+                        
+                        # Show debug info - TOP 3 matches with distances
+                        st.markdown("#### 🔍 Match Details:")
+                        debug_info = []
+                        for i, (_, row) in enumerate(df_sorted.head(3).iterrows()):
+                            row_fname = os.path.basename(row['identity'])
+                            debug_info.append(f"#{i+1}: {row_fname} (distance: {row['distance']:.3f})")
+                        st.code("\n".join(debug_info))
+                        
+                        # LIVENESS CHECK - Prevent photo spoofing
+                        is_live, liveness_score, liveness_reason = check_liveness(image, (fx, fy, fw, fh))
+                        st.markdown(f"#### 🛡️ Liveness: {'✅ PASS' if is_live else '❌ FAIL'} (Score: {liveness_score}/100)")
+                        if not is_live:
+                            st.warning(f"⚠️ Spoofing detected: {liveness_reason}")
+                        
+                        # SIMPLE THRESHOLD: 0.55 for genuine match
+                        # Real person: distance 0.20 - 0.52
+                        # Fake match: distance 0.58 - 0.80
+                        THRESHOLD = 0.55
+                        
+                        is_verified = False
+                        # Must pass BOTH face match AND liveness check
+                        if best_dist < THRESHOLD and is_user_registered(identity) and is_live:
+                            is_verified = True
+                            confidence = max(0, min(100, (1 - best_dist/0.6) * 100))
+                            
+                            found_someone = True
+                            recognized_name = identity
+                            recognized_confidence = confidence
+                            
+                            # Check if already marked today
+                            already_marked = is_attendance_marked_today(identity)
+                            
+                            if already_marked:
+                                # Yellow box - already marked
+                                cv2.rectangle(display_img, (fx, fy), (fx+fw, fy+fh), (0, 255, 255), 3)
+                                label = f"{identity} | {confidence:.0f}% | Marked"
+                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                                cv2.rectangle(display_img, (fx, fy-th-15), (fx+tw+10, fy), (0, 255, 255), -1)
+                                cv2.putText(display_img, label, (fx+5, fy-8), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+                            else:
+                                # Green box - new attendance
+                                cv2.rectangle(display_img, (fx, fy), (fx+fw, fy+fh), (0, 255, 0), 3)
+                                label = f"{identity} | {confidence:.0f}%"
+                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                                cv2.rectangle(display_img, (fx, fy-th-15), (fx+tw+10, fy), (0, 255, 0), -1)
+                                cv2.putText(display_img, label, (fx+5, fy-8), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                                # Mark attendance
+                                log_attendance(identity, confidence)
+                        
+                        if not is_verified:
+                            # Check why verification failed
+                            if best_dist < THRESHOLD and is_user_registered(identity) and not is_live:
+                                # Face matched but LIVENESS FAILED - likely photo attack
+                                spoof_detected = True
+                                cv2.rectangle(display_img, (fx, fy), (fx+fw, fy+fh), (0, 165, 255), 3)  # Orange
+                                label = f"SPOOF DETECTED"
+                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                                cv2.rectangle(display_img, (fx, fy-th-15), (fx+tw+10, fy), (0, 165, 255), -1)
+                                cv2.putText(display_img, label, (fx+5, fy-8), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                            else:
+                                # Unknown face - Red box
+                                cv2.rectangle(display_img, (fx, fy), (fx+fw, fy+fh), (0, 0, 255), 3)
+                                label = f"UNKNOWN ({best_dist:.2f})"
+                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                                cv2.rectangle(display_img, (fx, fy-th-15), (fx+tw+10, fy), (0, 0, 255), -1)
+                                cv2.putText(display_img, label, (fx+5, fy-8), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Show result image
+                st.image(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                
+                # Show recognition result below
+                if found_someone:
+                    if already_marked:
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(45deg, #f39c12, #f1c40f); padding: 25px; border-radius: 15px; text-align: center; margin: 10px 0;">
+                            <h2 style="color: #333; margin: 0;">👤 {recognized_name}</h2>
+                            <h3 style="color: #333; margin: 10px 0;">🎯 Score: {recognized_confidence:.1f}%</h3>
+                            <p style="color: #333; margin: 0;">⚠️ Already marked attendance today!</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(45deg, #11998e, #38ef7d); padding: 25px; border-radius: 15px; text-align: center; margin: 10px 0;">
+                            <h2 style="color: white; margin: 0;">👤 {recognized_name}</h2>
+                            <h3 style="color: white; margin: 10px 0;">🎯 Score: {recognized_confidence:.1f}%</h3>
+                            <p style="color: white; margin: 0;">✅ Attendance Marked!</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    # Check if it was a spoof attempt
+                    if spoof_detected:
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(45deg, #ff6b35, #f7931e); padding: 25px; border-radius: 15px; text-align: center; margin: 10px 0;">
+                            <h2 style="color: white; margin: 0;">🚫 SPOOF DETECTED!</h2>
+                            <p style="color: white; margin: 0;">Photo/screen attack blocked. Use real face!</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(45deg, #eb3349, #f45c43); padding: 25px; border-radius: 15px; text-align: center; margin: 10px 0;">
+                            <h2 style="color: white; margin: 0;">❓ Face Not Recognized</h2>
+                            <p style="color: white; margin: 0;">Not registered or no face detected</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+            except ImportError:
+                st.error("❌ DeepFace not installed! Run: `python -m pip install deepface tf-keras`")
+            except Exception as e:
+                st.error(f"❌ Error: {str(e)}")
 
 # ==================== ATTENDANCE PAGE ====================
 elif st.session_state.page == 'attendance':
