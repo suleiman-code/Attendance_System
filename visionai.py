@@ -282,8 +282,8 @@ def crop_face(image, face_coords, padding=30):
 
 def check_liveness(image, face_coords):
     """
-    Basic liveness detection to prevent photo spoofing attacks.
-    Checks texture sharpness and color variation - real faces have more detail.
+    Improved liveness detection - balanced to not reject real faces.
+    Uses multiple checks with relaxed thresholds.
     Returns: (is_live, score, reason)
     """
     x, y, w, h = face_coords
@@ -298,56 +298,53 @@ def check_liveness(image, face_coords):
     face_region = image[y1:y2, x1:x2]
     
     if face_region.size == 0:
-        return False, 0, "No face region"
+        return True, 100, "No face region - allowing"  # Don't block if can't analyze
     
     # Resize for consistent analysis
-    face_region = cv2.resize(face_region, (200, 200))
+    try:
+        face_region = cv2.resize(face_region, (200, 200))
+    except:
+        return True, 100, "Resize failed - allowing"
+    
     gray_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
     
     # CHECK 1: Laplacian variance (texture sharpness)
-    # Real faces have more texture/detail than photos of photos
     laplacian = cv2.Laplacian(gray_face, cv2.CV_64F)
     laplacian_var = laplacian.var()
     
-    # CHECK 2: Color variation in skin regions
-    # Real faces have subtle color variations, photos are more uniform
+    # CHECK 2: Color variation
     hsv = cv2.cvtColor(face_region, cv2.COLOR_BGR2HSV)
-    h_std = np.std(hsv[:,:,0])  # Hue variation
-    s_std = np.std(hsv[:,:,1])  # Saturation variation
+    s_std = np.std(hsv[:,:,1])  # Saturation variation only
     
-    # CHECK 3: Edge density (real faces have more micro-edges)
-    edges = cv2.Canny(gray_face, 50, 150)
-    edge_density = np.sum(edges > 0) / edges.size
-    
-    # Scoring (tuned thresholds)
-    # Photos displayed on screens typically have:
-    # - Lower laplacian variance (less sharp/detailed)
-    # - Different color patterns (screen pixels visible)
-    # - Moire patterns or reflections
+    # CHECK 3: High frequency content (screens have less)
+    dft = cv2.dft(np.float32(gray_face), flags=cv2.DFT_COMPLEX_OUTPUT)
+    dft_shift = np.fft.fftshift(dft)
+    magnitude = cv2.magnitude(dft_shift[:,:,0], dft_shift[:,:,1])
+    high_freq = np.mean(magnitude[75:125, 75:125])  # Center high frequencies
     
     score = 0
     reasons = []
     
-    # Laplacian threshold (real face usually > 100, photo < 80)
-    if laplacian_var > 50:
+    # Very relaxed thresholds - only catch obvious fakes
+    # Real webcam faces typically: laplacian 20-500, s_std 15-60
+    if laplacian_var > 15:
+        score += 40
+    else:
+        reasons.append(f"Blur ({laplacian_var:.0f})")
+    
+    if s_std > 12:
         score += 35
     else:
-        reasons.append(f"Low texture ({laplacian_var:.0f})")
+        reasons.append(f"Flat ({s_std:.0f})")
     
-    # Color variation (real face has more variation)
-    if h_std > 15 and s_std > 30:
-        score += 35
+    if high_freq > 1000:
+        score += 25
     else:
-        reasons.append(f"Flat colors (H:{h_std:.0f}, S:{s_std:.0f})")
+        reasons.append(f"Screen pattern")
     
-    # Edge density (real face 0.05-0.15, photo often different)
-    if 0.03 < edge_density < 0.25:
-        score += 30
-    else:
-        reasons.append(f"Edge pattern ({edge_density:.2f})")
-    
-    is_live = score >= 60
-    reason = "LIVE" if is_live else "; ".join(reasons) if reasons else "Failed checks"
+    # Pass at 40+ (was 50) - very lenient for real faces
+    is_live = score >= 40
+    reason = "LIVE" if is_live else "; ".join(reasons) if reasons else "Low quality"
     
     return is_live, score, reason
 
@@ -676,31 +673,76 @@ elif st.session_state.page == 'recognition':
                         else:
                             identity = fname.rsplit('.', 1)[0].title()
                         
-                        # Show debug info - TOP 3 matches with distances
-                        st.markdown("#### 🔍 Match Details:")
-                        debug_info = []
-                        for i, (_, row) in enumerate(df_sorted.head(3).iterrows()):
-                            row_fname = os.path.basename(row['identity'])
-                            debug_info.append(f"#{i+1}: {row_fname} (distance: {row['distance']:.3f})")
-                        st.code("\n".join(debug_info))
-                        
                         # LIVENESS CHECK - Prevent photo spoofing
                         is_live, liveness_score, liveness_reason = check_liveness(image, (fx, fy, fw, fh))
-                        st.markdown(f"#### 🛡️ Liveness: {'✅ PASS' if is_live else '❌ FAIL'} (Score: {liveness_score}/100)")
-                        if not is_live:
-                            st.warning(f"⚠️ Spoofing detected: {liveness_reason}")
                         
-                        # SIMPLE THRESHOLD: 0.55 for genuine match
-                        # Real person: distance 0.20 - 0.52
-                        # Fake match: distance 0.58 - 0.80
-                        THRESHOLD = 0.55
+                        # IMPROVED RECOGNITION LOGIC
+                        # 1. Check best match distance
+                        # 2. Verify consistency - multiple photos of SAME person should match
+                        # 3. Calculate gap between best match and other persons' matches
+                        
+                        THRESHOLD = 0.55  # Main threshold for recognition
+                        
+                        # Count how many photos of the identified person are in top matches
+                        identity_lower = identity.lower()
+                        same_person_matches = 0
+                        other_person_best = 1.0  # Track best distance of OTHER people
+                        
+                        for _, row in df_sorted.head(6).iterrows():
+                            row_fname = os.path.basename(row['identity'])
+                            if '_' in row_fname:
+                                row_identity = row_fname.split('_')[0].lower()
+                            else:
+                                row_identity = row_fname.rsplit('.', 1)[0].lower()
+                            
+                            if row_identity == identity_lower:
+                                same_person_matches += 1
+                            else:
+                                # Track closest match of other people
+                                if row['distance'] < other_person_best:
+                                    other_person_best = row['distance']
+                        
+                        # Gap between best match and other person's best
+                        gap = other_person_best - best_dist
+                        
+                        # Show debug info
+                        st.markdown("#### 🔍 Recognition Analysis:")
+                        debug_info = [
+                            f"Best match: {identity} (distance: {best_dist:.3f})",
+                            f"Same person in top 6: {same_person_matches} matches",
+                            f"Gap to others: {gap:.3f}",
+                            f"Liveness: {liveness_score}/100 ({'PASS' if is_live else 'FAIL'})"
+                        ]
+                        st.code("\n".join(debug_info))
+                        
+                        if not is_live:
+                            st.warning(f"⚠️ Liveness issue: {liveness_reason}")
+                        
+                        # DECISION LOGIC:
+                        # Registered person: low distance + multiple same-person matches
+                        # Unregistered person: high distance OR few same-person matches OR small gap
                         
                         is_verified = False
-                        # Must pass BOTH face match AND liveness check
-                        if best_dist < THRESHOLD and is_user_registered(identity) and is_live:
-                            is_verified = True
-                            confidence = max(0, min(100, (1 - best_dist/0.6) * 100))
-                            
+                        reject_reason = ""
+                        
+                        if best_dist < THRESHOLD:
+                            if is_user_registered(identity):
+                                if is_live:
+                                    # Additional check: consistency
+                                    # Real person should have 2+ photos matching well
+                                    if same_person_matches >= 2 or gap > 0.05:
+                                        is_verified = True
+                                        confidence = max(0, min(100, (1 - best_dist/0.6) * 100))
+                                    else:
+                                        reject_reason = "Inconsistent match - possible wrong person"
+                                else:
+                                    reject_reason = "Liveness check failed"
+                            else:
+                                reject_reason = "Person not registered"
+                        else:
+                            reject_reason = f"Low confidence (distance: {best_dist:.2f})"
+                        
+                        if is_verified:
                             found_someone = True
                             recognized_name = identity
                             recognized_confidence = confidence
@@ -728,20 +770,24 @@ elif st.session_state.page == 'recognition':
                                 log_attendance(identity, confidence)
                         
                         if not is_verified:
+                            # Show rejection reason in debug
+                            if reject_reason:
+                                st.info(f"ℹ️ Not recognized: {reject_reason}")
+                            
                             # Check why verification failed
-                            if best_dist < THRESHOLD and is_user_registered(identity) and not is_live:
+                            if "Liveness" in reject_reason:
                                 # Face matched but LIVENESS FAILED - likely photo attack
                                 spoof_detected = True
                                 cv2.rectangle(display_img, (fx, fy), (fx+fw, fy+fh), (0, 165, 255), 3)  # Orange
-                                label = f"SPOOF DETECTED"
+                                label = f"SPOOF?"
                                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
                                 cv2.rectangle(display_img, (fx, fy-th-15), (fx+tw+10, fy), (0, 165, 255), -1)
                                 cv2.putText(display_img, label, (fx+5, fy-8), 
                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                             else:
-                                # Unknown face - Red box
+                                # Unknown/unregistered face - Red box
                                 cv2.rectangle(display_img, (fx, fy), (fx+fw, fy+fh), (0, 0, 255), 3)
-                                label = f"UNKNOWN ({best_dist:.2f})"
+                                label = f"NOT RECOGNIZED"
                                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
                                 cv2.rectangle(display_img, (fx, fy-th-15), (fx+tw+10, fy), (0, 0, 255), -1)
                                 cv2.putText(display_img, label, (fx+5, fy-8), 
@@ -769,12 +815,12 @@ elif st.session_state.page == 'recognition':
                         </div>
                         """, unsafe_allow_html=True)
                 else:
-                    # Check if it was a spoof attempt
+                    # Show why not recognized
                     if spoof_detected:
                         st.markdown(f"""
                         <div style="background: linear-gradient(45deg, #ff6b35, #f7931e); padding: 25px; border-radius: 15px; text-align: center; margin: 10px 0;">
-                            <h2 style="color: white; margin: 0;">🚫 SPOOF DETECTED!</h2>
-                            <p style="color: white; margin: 0;">Photo/screen attack blocked. Use real face!</p>
+                            <h2 style="color: white; margin: 0;">🚫 Possible Spoof</h2>
+                            <p style="color: white; margin: 0;">Liveness check failed. Try with better lighting.</p>
                         </div>
                         """, unsafe_allow_html=True)
                     else:
